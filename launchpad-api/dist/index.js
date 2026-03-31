@@ -9,24 +9,39 @@ const supabase_js_1 = require("@supabase/supabase-js");
 const cors_1 = __importDefault(require("cors"));
 const express_1 = __importDefault(require("express"));
 const coach_1 = require("./routes/coach");
-// ── Validate required environment variables before anything else ────────────
+// ── Log missing env vars but don't exit — server must start for Railway ──────
 const REQUIRED_ENV = ["SUPABASE_URL", "SUPABASE_ANON_KEY", "ANTHROPIC_API_KEY"];
 const missing = REQUIRED_ENV.filter((key) => !process.env[key]);
 if (missing.length > 0) {
-    console.error(`[LaunchPad API] Missing required environment variables: ${missing.join(", ")}`);
-    console.error("Set these in your Railway dashboard under Variables.");
-    process.exit(1);
+    console.error(`[LaunchPad API] Missing env vars: ${missing.join(", ")}. ` +
+        "Add them in Railway → Variables. API routes will return 503 until set.");
 }
 const app = (0, express_1.default)();
 app.use(express_1.default.json());
 app.use((0, cors_1.default)());
-const supabase = (0, supabase_js_1.createClient)(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
-// Health check
+// Create Supabase client only when credentials are present
+let supabase = null;
+if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
+    supabase = (0, supabase_js_1.createClient)(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+}
+// Middleware that gates any route needing Supabase
+function requireDb(_req, res, next) {
+    if (!supabase) {
+        res.status(503).json({ error: "Database not configured — SUPABASE_URL / SUPABASE_ANON_KEY missing" });
+        return;
+    }
+    next();
+}
+// ── Health check — always responds, shows env var status ─────────────────────
 app.get("/health", (_req, res) => {
-    res.json({ status: "ok", app: "LaunchPad API" });
+    res.json({
+        status: "ok",
+        app: "LaunchPad API",
+        env: missing.length === 0 ? "all vars set" : `missing: ${missing.join(", ")}`,
+    });
 });
-// Schemes routes
-app.get("/schemes", async (_req, res) => {
+// ── Schemes routes ────────────────────────────────────────────────────────────
+app.get("/schemes", requireDb, async (_req, res) => {
     const { data, error } = await supabase
         .from("schemes")
         .select("*")
@@ -35,7 +50,7 @@ app.get("/schemes", async (_req, res) => {
         return res.status(500).json({ error: error.message });
     res.json(data);
 });
-app.get("/schemes/:id", async (req, res) => {
+app.get("/schemes/:id", requireDb, async (req, res) => {
     const { data, error } = await supabase
         .from("schemes")
         .select("*")
@@ -45,8 +60,8 @@ app.get("/schemes/:id", async (req, res) => {
         return res.status(404).json({ error: "Scheme not found" });
     res.json(data);
 });
-// Applications routes
-app.get("/applications/:userId", async (req, res) => {
+// ── Applications routes ───────────────────────────────────────────────────────
+app.get("/applications/:userId", requireDb, async (req, res) => {
     const { data, error } = await supabase
         .from("applications")
         .select(`
@@ -66,12 +81,10 @@ app.get("/applications/:userId", async (req, res) => {
         return res.status(500).json({ error: error.message });
     res.json(data);
 });
-app.post("/applications", async (req, res) => {
+app.post("/applications", requireDb, async (req, res) => {
     const { user_id, scheme_id, stage, deadline, notes } = req.body;
     if (!user_id || !scheme_id) {
-        return res
-            .status(400)
-            .json({ error: "user_id and scheme_id are required" });
+        return res.status(400).json({ error: "user_id and scheme_id are required" });
     }
     const { data, error } = await supabase
         .from("applications")
@@ -88,7 +101,7 @@ app.post("/applications", async (req, res) => {
         return res.status(500).json({ error: error.message });
     res.status(201).json(data);
 });
-app.patch("/applications/:id", async (req, res) => {
+app.patch("/applications/:id", requireDb, async (req, res) => {
     const { stage, notes, deadline } = req.body;
     const { data, error } = await supabase
         .from("applications")
@@ -100,7 +113,7 @@ app.patch("/applications/:id", async (req, res) => {
         return res.status(500).json({ error: error.message });
     res.json(data);
 });
-app.delete("/applications/:id", async (req, res) => {
+app.delete("/applications/:id", requireDb, async (req, res) => {
     const { error } = await supabase
         .from("applications")
         .delete()
@@ -109,9 +122,9 @@ app.delete("/applications/:id", async (req, res) => {
         return res.status(500).json({ error: error.message });
     res.status(204).send();
 });
-// Coach route
+// ── Coach route ───────────────────────────────────────────────────────────────
 app.use("/coach", coach_1.router);
-// ── Catch unhandled errors so Railway logs show the real reason ──────────────
+// ── Global error handlers ─────────────────────────────────────────────────────
 process.on("uncaughtException", (err) => {
     console.error("[LaunchPad API] Uncaught exception:", err);
     process.exit(1);
