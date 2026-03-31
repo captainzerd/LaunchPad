@@ -6,6 +6,15 @@ import cors from "cors";
 import express from "express";
 import { router as coachRouter } from "./routes/coach";
 
+// ── Validate required environment variables before anything else ────────────
+const REQUIRED_ENV = ["SUPABASE_URL", "SUPABASE_ANON_KEY", "ANTHROPIC_API_KEY"];
+const missing = REQUIRED_ENV.filter((key) => !process.env[key]);
+if (missing.length > 0) {
+  console.error(`[LaunchPad API] Missing required environment variables: ${missing.join(", ")}`);
+  console.error("Set these in your Railway dashboard under Variables.");
+  process.exit(1);
+}
+
 const app = express();
 app.use(express.json());
 app.use(cors());
