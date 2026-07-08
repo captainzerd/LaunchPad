@@ -3,8 +3,37 @@ dotenv.config();
 
 import Anthropic from "@anthropic-ai/sdk";
 import { Router } from "express";
+import rateLimit from "express-rate-limit";
 
 const router = Router();
+
+// ── Rate limit: 20 requests per minute per IP ─────────────────────────────────
+const coachLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests — please wait a moment before trying again." },
+});
+
+router.use(coachLimiter);
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+type HistoryMessage = {
+  role: "user" | "assistant";
+  content: string;
+};
+
+type UserProfile = {
+  full_name?: string;
+  university?: string;
+  degree?: string;
+  graduation_year?: string | number;
+  target_sectors?: string[];
+};
+
+// ── System prompts ────────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPTS: Record<string, string> = {
   "CV Review":
@@ -19,47 +48,85 @@ const SYSTEM_PROMPTS: Record<string, string> = {
     "You are LaunchPad Coach, a UK assessment centre specialist. Help students prepare for graduate scheme assessment centres including group exercises, case studies, presentations and in-tray exercises. Give concrete strategies and examples.",
 };
 
+const VALID_COACHING_TYPES = Object.keys(SYSTEM_PROMPTS);
+
+// ── POST /coach ───────────────────────────────────────────────────────────────
+
 router.post("/", async (req, res) => {
-  console.log("Coach route hit:", {
-    coachingType: req.body.coachingType,
-    messageLength: req.body.message?.length,
-  });
+  const { message, coachingType, history, userProfile } = req.body as {
+    message: unknown;
+    coachingType: unknown;
+    history: unknown;
+    userProfile: unknown;
+  };
 
+  console.log("[coach] POST type:", coachingType, "messageLength:", typeof message === "string" ? message.length : 0);
+
+  // ── Validation ──────────────────────────────────────────────────────────────
+  if (!message || typeof message !== "string" || message.trim() === "") {
+    return res.status(400).json({ error: "message is required" });
+  }
+
+  if (message.length > 4000) {
+    return res.status(400).json({ error: "message must be 4000 characters or fewer" });
+  }
+
+  if (!process.env.ANTHROPIC_API_KEY) {
+    console.error("[coach] ANTHROPIC_API_KEY not set");
+    return res.status(503).json({ error: "AI service not configured" });
+  }
+
+  // Validate and normalise history
+  const rawHistory = Array.isArray(history) ? history : [];
+  const validatedHistory: HistoryMessage[] = rawHistory
+    .filter(
+      (h): h is HistoryMessage =>
+        h !== null &&
+        typeof h === "object" &&
+        (h.role === "user" || h.role === "assistant") &&
+        typeof h.content === "string",
+    )
+    .slice(-20); // cap at last 20 turns to control token spend
+
+  // Anthropic requires conversations to start with a user turn.
+  // Drop any leading assistant messages (e.g. the UI starter greeting).
+  while (validatedHistory.length > 0 && validatedHistory[0].role === "assistant") {
+    validatedHistory.shift();
+  }
+
+  // ── Build system prompt ─────────────────────────────────────────────────────
+  const resolvedType =
+    typeof coachingType === "string" && VALID_COACHING_TYPES.includes(coachingType)
+      ? coachingType
+      : "CV Review";
+
+  const basePrompt = SYSTEM_PROMPTS[resolvedType];
+
+  let userContext = "";
+  if (userProfile && typeof userProfile === "object") {
+    const p = userProfile as UserProfile;
+    const name = p.full_name || "The user";
+    const sectors =
+      Array.isArray(p.target_sectors) && p.target_sectors.length > 0
+        ? p.target_sectors.join(", ")
+        : "various sectors";
+    userContext =
+      `\n\nUser context: ${name} is a ${p.graduation_year ?? ""} student at ${p.university ?? "university"} ` +
+      `studying ${p.degree ?? "an unknown subject"}, targeting ${sectors}.`;
+  }
+
+  const systemPrompt = basePrompt + userContext;
+
+  // ── Call Anthropic ──────────────────────────────────────────────────────────
   try {
-    const { message, coachingType, history, userProfile } = req.body;
+    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-    if (!message) {
-      return res.status(400).json({ error: "message is required" });
-    }
-
-    const anthropic = new Anthropic({
-      apiKey: process.env.ANTHROPIC_API_KEY,
-    });
-
-    const basePrompt = SYSTEM_PROMPTS[coachingType] || SYSTEM_PROMPTS["CV Review"];
-
-    let userContext = "";
-    if (userProfile) {
-      const { full_name, university, degree, graduation_year, target_sectors } = userProfile;
-      const name = full_name || "The user";
-      const sectors =
-        Array.isArray(target_sectors) && target_sectors.length > 0
-          ? target_sectors.join(", ")
-          : "various sectors";
-      userContext = `\n\nUser context: ${name} is a ${graduation_year ?? ""} student at ${university ?? "university"} studying ${degree ?? "an unknown subject"}, targeting ${sectors}.`.replace(/  +/g, " ");
-    }
-
-    const systemPrompt = basePrompt + userContext;
-
-    const messages = [
-      ...(history || []).map((h: any) => ({
-        role: h.role as "user" | "assistant",
-        content: String(h.content),
-      })),
-      { role: "user" as const, content: String(message) },
+    const messages: Anthropic.MessageParam[] = [
+      ...validatedHistory.map((h) => ({ role: h.role, content: h.content })),
+      { role: "user", content: message.trim() },
     ];
 
-    console.log("Calling Anthropic API with", messages.length, "messages");
+    console.log("[coach] calling Anthropic,", messages.length, "messages, type:", resolvedType);
 
     const completion = await anthropic.messages.create({
       model: "claude-sonnet-4-6",
@@ -68,17 +135,17 @@ router.post("/", async (req, res) => {
       messages,
     });
 
-    console.log("Anthropic API response received");
+    console.log("[coach] Anthropic response received, stop_reason:", completion.stop_reason);
 
     const responseText =
       completion.content[0].type === "text"
         ? completion.content[0].text
         : "Sorry, I could not generate a response";
 
-    res.json({ response: responseText });
-  } catch (error: any) {
-    console.error("Coach route error:", error.message);
-    res.status(500).json({ error: error.message });
+    res.json({ data: { response: responseText } });
+  } catch (err: any) {
+    console.error("[coach] Anthropic error:", err.message);
+    res.status(500).json({ error: "AI service error — please try again" });
   }
 });
 
